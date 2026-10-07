@@ -124,10 +124,13 @@ What that means in practice:
   publishes one. The company-size filter therefore cannot run, and the search
   page states that plainly instead of showing a filter that did nothing.
 - **Results are capped at 40** and only the first page is returned.
-- **Searches take roughly 10 seconds** and occasionally fail. Overpass is a shared
-  public instance; it rate-limits and times out under load, and it is not under
-  this application's control. Failures are reported as a clear message, and no
-  request is retried automatically.
+- **Searches take roughly 10–20 seconds** and occasionally fail. Overpass is a
+  shared public instance; it rejects queries when it is under load, and it is not
+  under this application's control. A transient rejection (`502`/`503`/`504`) is
+  retried, up to three attempts within a 60-second budget. A rate limit (`429`)
+  or a rejected query (`400`) is *not* retried — repeating those makes the
+  problem worse. If every attempt fails the search reports a clear message, never
+  a raw error.
 - **Coverage varies by industry and region.** OSM is strongest in European cities.
   Industries outside the built-in alias table fall back to matching the business
   name, which is narrower.

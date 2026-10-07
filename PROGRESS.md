@@ -229,10 +229,13 @@ four hostile payloads — zero metacharacters reach the query.
    provider, not a bug. Disclosed in the UI. Adding a size filter requires a
    different provider.
 2. **The public Overpass instance is slow and intermittently unavailable.**
-   Searches took 9–15s in testing. One run returned a 504 that a retry cleared;
-   later runs hit `429`. Failures surface as a clear "that search took too long /
-   try a smaller location" message, but a search can fail for reasons outside
-   this application's control. The brief forbids automatic retries.
+   Searches took 11–20s in testing against a healthy instance, and the measured
+   degradation is severe: a ~300m bounding box returning five elements took
+   10.4s, and the same query alternated between `200` and `504` on consecutive
+   runs. The failure tracks the instance's state, not the request. Transient
+   rejections are retried — see "Post-Phase 5 — retry on transient Overpass
+   failures" below — and anything that still fails surfaces as a clear "that
+   search took too long / try a smaller location" message, not a raw error.
 3. **Coverage is uneven by industry and region.** OSM is strong on European
    cities and patchy elsewhere. An industry absent from the ~30-entry alias table
    falls back to matching the business *name*, which is narrower.
@@ -555,5 +558,93 @@ to 5, and `npx tsc --noEmit`, `npm run lint` and `npm run build` all pass.
 the UI. The Phase 3 provider was verified by calling it directly, and Phase 2's
 auth was listed as UNVERIFIED — so nothing had ever exercised the two together
 until now. Treat the rest of the search path as unproven for the same reason.
+
+## Post-Phase 5 — retry on transient Overpass failures
+
+`lib/providers/overpass.ts` previously made exactly one request and surfaced any
+failure immediately, so a momentary `504` from a busy Overpass instance became a
+permanent error the user had to work around by retrying by hand.
+
+### What the diagnosis found
+
+The failures were **not** a database problem and **not** a defect in the query.
+Measured against `overpass-api.de`:
+
+- Four of four searches returned `504` on the first run, across four cities and
+  industries, in 9–15s. The query's own budget is `[timeout:25]`, so the instance
+  was rejecting rather than timing out.
+- A control query — a ~300m bounding box returning **five** elements — took
+  **10.4s**. No query that small is slow to *execute*; that is time spent queued.
+- The *same* query alternated between `200` and `504` on consecutive runs, and in
+  one round a trivial control failed while an expensive query succeeded.
+
+The outcome was therefore uncorrelated with the request, which is what separates
+instance-side instability from a query defect. The obvious suspect — the
+`nwr[~"key-regex"~"value"]` form, which cannot use an index — was tested and
+**refuted**: a fixed-key rewrite returned 0 elements in 34.4s where the existing
+form returned 60 in 11.6s. The query was left alone.
+
+The database was separately confirmed healthy (`auth/v1/health` → 200 in 0.97s;
+REST → 401 in 2.53s, correct for locked-down `anon`). The reported error is
+raised in `friendlyProviderError()` *before* any Supabase call is made, so this
+path never reaches the database.
+
+Worth recording: Phase 1 and Phase 2 searches appeared to work because they used
+mock data and made no network calls at all. `lib/providers/mock.ts` was deleted
+in Phase 3 — which is when real failures became possible.
+
+### Behaviour now
+
+| Response | Retried? | Why |
+|---|---|---|
+| `502` / `503` / `504` | Yes, up to 3 attempts | Transient load — "try again" |
+| Transport error (reset, DNS, TLS) | Yes, up to 3 attempts | Transient by nature |
+| Attempt timeout | Yes, if budget remains | May succeed on a fresher connection |
+| `429` | **No** | Retrying worsens rate limiting and risks a block |
+| `400` | **No** | The query itself was rejected; it would be again |
+| `500` / anything else | **No** | Signals a fault, not load |
+
+- **Three attempts maximum**, with exponential backoff (400ms, then 800ms) plus
+  jitter. The jitter matters more than the exponent: Overpass is shared, so
+  unsynchronised clients would otherwise retry in step and compound the load that
+  caused the rejection.
+- **A 60-second total budget** caps all attempts together, and no single attempt
+  may outlive it. Retrying cannot extend the caller's worst case without bound.
+- The last failure is the one reported, so the user sees the most recent reason
+  rather than the first.
+- **Nominatim is deliberately not retried.** It asks for at most one request per
+  second and its failures are overwhelmingly rate limits, so repeating a call
+  would breach its usage policy rather than fix anything. Its lookups are cached
+  instead, which is the appropriate response to that limit.
+
+This supersedes the Phase 3 note that "the brief forbids automatic retries" —
+that constraint was lifted for this specific, bounded case.
+
+### Testing
+
+`overpass.ts` has only type-only imports, so it compiles standalone and runs
+against a stubbed `fetch`. Every check exercises the shipped code rather than a
+reimplementation. **31 checks, all passing:**
+
+- `504` → `200` retries and succeeds, in exactly 2 calls
+- `504`, `504`, `200` succeeds on the third attempt
+- `503` and `502` are each retried
+- A transport error is retried
+- `504` ×3 gives up with kind `timeout`, stopping at exactly 3 calls
+- `429` fails immediately with kind `rate_limited`, in exactly 1 call
+- `400` fails immediately with kind `bad_response`, in exactly 1 call
+- `500` fails immediately with kind `unavailable`, in exactly 1 call
+- Nominatim `429` makes exactly 1 Nominatim call and never reaches Overpass
+- `200` on the first attempt still makes exactly 1 call (no regression)
+- Backoff is observed to wait ~400ms before the second attempt
+
+`npx tsc --noEmit`, `npx eslint` and `npm run build` all pass.
+
+### Still unproven
+
+Search has still never been observed succeeding end-to-end through the UI with a
+real session. The retry makes a transient rejection survivable, but the
+underlying instance remains slow and best-effort, and searches may still fail
+when it is badly degraded.
 
 

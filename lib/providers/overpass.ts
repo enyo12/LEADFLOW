@@ -37,7 +37,38 @@ export const MAX_RESULTS = 40;
 const FETCH_LIMIT = 60;
 
 const GEOCODE_TIMEOUT_MS = 10_000;
-const OVERPASS_TIMEOUT_MS = 30_000;
+
+// --- Overpass retry policy -------------------------------------------------
+//
+// The public Overpass instances are best-effort, and when they are under load
+// they reject *quickly* rather than slowly: a degraded instance answers 503/504
+// in ~10s where a healthy one would already have returned results. Measured
+// against overpass-api.de, a trivial bounding box returning five elements took
+// 10.4s, and the same query alternated between 200 and 504 on consecutive runs
+// — so the failure tracks the instance's state, not the request. That is
+// transient by nature and worth another attempt; without one, a momentary blip
+// becomes a permanent error the user has to work around by retrying by hand.
+//
+// Deliberately NOT retried:
+//   429 — we are being rate limited. Retrying makes that strictly worse and
+//         risks the caller being blocked outright, so it fails immediately.
+//   400 — the query itself was rejected; it would be rejected again.
+//
+// Nominatim is not retried either. It asks for at most one request per second,
+// and its failures are overwhelmingly rate limits, so repeating a call there
+// would breach its usage policy rather than fix anything. Its lookups are
+// cached, which is the appropriate response to that limit.
+
+/** Total attempts, including the first. */
+const OVERPASS_MAX_ATTEMPTS = 3;
+const OVERPASS_ATTEMPT_TIMEOUT_MS = 30_000;
+/**
+ * Ceiling for all attempts combined. A retry may never push the caller past
+ * this — the user is sitting in front of a loading state while it runs, so the
+ * worst case has to stay bounded even when every attempt is slow.
+ */
+const OVERPASS_TOTAL_BUDGET_MS = 60_000;
+const RETRY_BASE_DELAY_MS = 400;
 
 export type ProviderErrorKind =
   | "location_not_found"
@@ -376,6 +407,103 @@ function toRawCompany(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Overpass request
+// ---------------------------------------------------------------------------
+
+function isRetryableStatus(status: number): boolean {
+  // 502/503/504 are the "service temporarily unavailable" family: bad gateway,
+  // overloaded, and gateway timeout. Overpass returns these when it is under
+  // load, and all three mean "try again". Everything else — including 400 and
+  // 429, which mean "this request is wrong" — is final.
+  return status === 502 || status === 503 || status === 504;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Exponential backoff with jitter.
+ *
+ * The jitter matters more than the exponent here: Overpass is a shared public
+ * service, so unsynchronised clients would otherwise retry in step and compound
+ * the very load that caused the rejection.
+ */
+function retryDelayMs(attempt: number): number {
+  const base = RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+  return base + Math.random() * RETRY_BASE_DELAY_MS;
+}
+
+/**
+ * POSTs the query, retrying transient failures within the total budget.
+ *
+ * Returns the first response worth acting on — including 400 and 429, which are
+ * final and surface to the caller unchanged. Throws a ProviderError once the
+ * attempts or the budget are spent, carrying the *last* failure so the reason
+ * reported is the most recent one rather than the first.
+ */
+async function requestOverpass(query: string): Promise<Response> {
+  const deadline = Date.now() + OVERPASS_TOTAL_BUDGET_MS;
+  let lastFailure: ProviderError | null = null;
+
+  for (let attempt = 1; attempt <= OVERPASS_MAX_ATTEMPTS; attempt++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+
+    try {
+      const response = await fetch(OVERPASS_ENDPOINT, {
+        method: "POST",
+        headers: {
+          "User-Agent": USER_AGENT,
+          "Content-Type": "application/x-www-form-urlencoded",
+          Accept: "application/json",
+        },
+        body: new URLSearchParams({ data: query }).toString(),
+        // Never let a single attempt outlive the overall budget.
+        signal: AbortSignal.timeout(
+          Math.min(OVERPASS_ATTEMPT_TIMEOUT_MS, remaining),
+        ),
+        cache: "no-store",
+      });
+
+      if (!isRetryableStatus(response.status)) return response;
+
+      lastFailure = new ProviderError(
+        "timeout",
+        `Business lookup timed out (HTTP ${response.status}).`,
+      );
+      console.warn(
+        `[leadflow] overpass answered ${response.status} — attempt ${attempt}/${OVERPASS_MAX_ATTEMPTS}`,
+      );
+    } catch (error) {
+      // AbortSignal.timeout raises a TimeoutError DOMException; anything else is
+      // a transport failure (connection reset, DNS, TLS). Both are worth another
+      // attempt, but they mean different things to the caller, so they map
+      // separately.
+      lastFailure =
+        error instanceof DOMException && error.name === "TimeoutError"
+          ? new ProviderError("timeout", "Business lookup timed out.")
+          : new ProviderError("unavailable", "Business lookup failed.");
+      console.warn(
+        `[leadflow] overpass request failed — attempt ${attempt}/${OVERPASS_MAX_ATTEMPTS}:`,
+        error,
+      );
+    }
+
+    if (attempt < OVERPASS_MAX_ATTEMPTS) {
+      const delay = retryDelayMs(attempt);
+      // Don't sleep into a retry there is no budget left to perform.
+      if (Date.now() + delay >= deadline) break;
+      await sleep(delay);
+    }
+  }
+
+  throw (
+    lastFailure ?? new ProviderError("timeout", "Business lookup timed out.")
+  );
+}
+
 export async function searchOpenStreetMap(
   criteria: SearchCriteria,
 ): Promise<RawProviderCompany[]> {
@@ -390,31 +518,14 @@ export async function searchOpenStreetMap(
   const tags = lookupIndustryTags(industry);
   const query = buildOverpassQuery(boundingBox, industry, tags);
 
-  let response: Response;
-  try {
-    response = await fetch(OVERPASS_ENDPOINT, {
-      method: "POST",
-      headers: {
-        "User-Agent": USER_AGENT,
-        "Content-Type": "application/x-www-form-urlencoded",
-        Accept: "application/json",
-      },
-      body: new URLSearchParams({ data: query }).toString(),
-      signal: AbortSignal.timeout(OVERPASS_TIMEOUT_MS),
-      cache: "no-store",
-    });
-  } catch (error) {
-    if (error instanceof DOMException && error.name === "TimeoutError") {
-      throw new ProviderError("timeout", "Business lookup timed out.");
-    }
-    throw new ProviderError("unavailable", "Business lookup failed.");
-  }
+  const response = await requestOverpass(query);
 
   if (response.status === 429) {
     throw new ProviderError("rate_limited", "Business lookup is rate limited.");
   }
-  // The public Overpass instances answer 504 when a query outruns their budget.
-  if (response.status === 504 || response.status === 503) {
+  // 503/504 are retried inside requestOverpass. Reaching here means every
+  // attempt was rejected, so the instance is genuinely unavailable to us.
+  if (response.status === 503 || response.status === 504) {
     throw new ProviderError("timeout", "Business lookup timed out.");
   }
   if (response.status === 400) {
